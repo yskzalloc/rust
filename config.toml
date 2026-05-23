@@ -1,0 +1,17 @@
+[llvm]
+download-ci-llvm = false
+
+[build]
+target = ["x86_64-unknown-linux-gnu"]
+docs = false
+extended = false
+
+[target.x86_64-unknown-linux-gnu]
+llvm-config = "../llvm-project/build/bin/llvm-config"
+cc = "../llvm-project/build/bin/clang"
+cxx = "../llvm-project/build/bin/clang++"
+
+[rust]
+codegen-backends = ["llvm"]
+debug-assertions = false
+channel = "nightly"
