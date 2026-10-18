@@ -32,6 +32,10 @@
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/CBindingWrapping.h"
 #include "llvm/Support/FileSystem.h"
+#if __has_include("llvm/Support/LibraryOptionsContext.h")
+#include "llvm/Support/LibraryOptionsContext.h"
+#define RUST_LLVM_PER_CONTEXT_OPTIONS 1
+#endif
 #include "llvm/Support/Program.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/VirtualFileSystem.h"
@@ -471,6 +475,19 @@ extern "C" void LLVMRustAddLibraryInfo(LLVMTargetMachineRef T,
 #endif
 }
 
+#ifdef RUST_LLVM_PER_CONTEXT_OPTIONS
+// LLVM keeps the options of per-context libraries (Passes, Scalar,
+// Instrumentation, CGData) in each LLVMContext, and a context starts out with
+// their defaults, not with what the command line set. Parse -Cllvm-args into
+// one context here and copy it into every module's context before its passes
+// run (see LLVMRustOptimize), as clang does with -mllvm. Without this, an
+// option such as -sanitizer-coverage-trace-pc-guard is accepted and ignored.
+static cl::LibraryOptionsContext &rustLLVMLibraryOptions() {
+  static cl::LibraryOptionsContext Options;
+  return Options;
+}
+#endif
+
 extern "C" void LLVMRustSetLLVMOptions(int Argc, char **Argv) {
   // Initializing the command-line options more than once is not allowed. So,
   // check if they've already been initialized. (This could happen if we're
@@ -480,7 +497,12 @@ extern "C" void LLVMRustSetLLVMOptions(int Argc, char **Argv) {
   if (Initialized)
     return;
   Initialized = true;
+#ifdef RUST_LLVM_PER_CONTEXT_OPTIONS
+  cl::parseCommandLineOptions(rustLLVMLibraryOptions(),
+                              ArrayRef<const char *>(Argv, Argc));
+#else
   cl::ParseCommandLineOptions(Argc, Argv);
+#endif
 }
 
 enum class LLVMRustFileType {
@@ -705,7 +727,16 @@ extern "C" LLVMRustResult LLVMRustOptimize(
   TargetMachine *TM = unwrap(TMRef);
   OptimizationLevel OptLevel = fromRust(OptLevelRust);
 
+#ifdef RUST_LLVM_PER_CONTEXT_OPTIONS
+  // Give the module's context the -Cllvm-args values of per-context
+  // libraries; see rustLLVMLibraryOptions().
+  cl::LibraryOptionsContext &LibraryOptions =
+      TheModule->getContext().getLibraryOptions();
+  LibraryOptions.assign(rustLLVMLibraryOptions());
+  PipelineTuningOptions PTO(&LibraryOptions);
+#else
   PipelineTuningOptions PTO;
+#endif
   PTO.LoopUnrolling = UnrollLoops;
   PTO.LoopInterleaving = UnrollLoops;
   PTO.LoopVectorization = LoopVectorize;
@@ -928,6 +959,57 @@ extern "C" LLVMRustResult LLVMRustOptimize(
                                             ThinOrFullLTOPhase phase) {
         MPM.addPass(RealtimeSanitizerPass());
       });
+    }
+  }
+
+  // SanitizerCoverage requested with `-Cpasses=sancov-module`, as the Linux
+  // kernel builds Rust code, has to instrument the program, not the checks
+  // the sanitizers above add to it: run after them, as the extra passes are,
+  // it traces their shadow-memory comparisons and gives their report blocks
+  // coverage of their own. Clang runs it at the end of the optimization
+  // pipeline before the sanitizers; do the same, and leave every other extra
+  // pass where it is. Without sanitizers nothing moves.
+  std::string SancovPasses, OtherExtraPasses;
+  if (ExtraPassesLen && !OptimizerLastEPCallbacks.empty()) {
+    StringRef Rest(ExtraPasses, ExtraPassesLen);
+    while (!Rest.empty()) {
+      // Split at the next top-level comma: pass parameters and nested
+      // pipelines have commas of their own.
+      size_t End = 0;
+      for (int Depth = 0; End < Rest.size(); ++End) {
+        char Ch = Rest[End];
+        if (Ch == '(' || Ch == '<')
+          ++Depth;
+        else if (Ch == ')' || Ch == '>')
+          --Depth;
+        else if (Ch == ',' && Depth == 0)
+          break;
+      }
+      StringRef Pass = Rest.take_front(End).trim();
+      Rest = Rest.drop_front(std::min(End + 1, Rest.size()));
+      std::string &To = Pass == "sancov-module" ||
+                                Pass.starts_with("sancov-module<")
+                            ? SancovPasses
+                            : OtherExtraPasses;
+      if (!To.empty())
+        To += ",";
+      To += Pass.str();
+    }
+    if (!SancovPasses.empty()) {
+      ModulePassManager Check;
+      if (auto Err = PB.parsePassPipeline(Check, SancovPasses)) {
+        std::string ErrMsg = toString(std::move(Err));
+        LLVMRustSetLastError(ErrMsg.c_str());
+        return LLVMRustResult::Failure;
+      }
+      OptimizerLastEPCallbacks.insert(
+          OptimizerLastEPCallbacks.begin(),
+          [&PB, SancovPasses](ModulePassManager &MPM, OptimizationLevel Level,
+                              ThinOrFullLTOPhase phase) {
+            cantFail(PB.parsePassPipeline(MPM, SancovPasses));
+          });
+      ExtraPasses = OtherExtraPasses.c_str();
+      ExtraPassesLen = OtherExtraPasses.size();
     }
   }
 
